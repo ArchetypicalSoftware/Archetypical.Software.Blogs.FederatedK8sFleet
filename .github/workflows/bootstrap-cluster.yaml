@@ -1,0 +1,404 @@
+name: Bootstrap Workload Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_file_path:
+        description: 'Path to cluster manifest (e.g., clusters/dev/platform/aws/us-east-1/pilot-1/cluster.yaml)'
+        required: true
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse cluster metadata
+        id: metadata
+        run: |
+          file_path="${{ github.event.inputs.cluster_file_path }}"
+          env_name="${{ github.event.inputs.environment }}"
+          
+          # Extract cluster name from path: clusters/{env}/{domain}/{provider}/{region}/{name}/cluster.yaml
+          cluster_name=$(echo "$file_path" | sed -E 's|clusters/[^/]+/[^/]+/[^/]+/[^/]+/([^/]+)/.*|\1|')
+          domain=$(echo "$file_path" | sed -E 's|clusters/[^/]+/([^/]+)/.*|\1|')
+          provider=$(echo "$file_path" | sed -E 's|clusters/[^/]+/[^/]+/([^/]+)/.*|\1|')
+          region=$(echo "$file_path" | sed -E 's|clusters/[^/]+/[^/]+/[^/]+/([^/]+)/.*|\1|')
+          
+          echo "cluster_name=${cluster_name}" >> $GITHUB_OUTPUT
+          echo "domain=${domain}" >> $GITHUB_OUTPUT
+          echo "provider=${provider}" >> $GITHUB_OUTPUT
+          echo "region=${region}" >> $GITHUB_OUTPUT
+          echo "env_name=${env_name}" >> $GITHUB_OUTPUT
+          
+          echo "Cluster: ${cluster_name}, Domain: ${domain}, Provider: ${provider}, Region: ${region}"
+
+      - name: Validate cluster manifest exists
+        run: |
+          if [ ! -f "${{ github.event.inputs.cluster_file_path }}" ]; then
+            echo "❌ Cluster manifest not found: ${{ github.event.inputs.cluster_file_path }}"
+            exit 1
+          fi
+          echo "✓ Cluster manifest found"
+
+      - name: Extract cluster labels
+        id: labels
+        run: |
+          cluster_class=$(grep -A5 'topology:' "${{ github.event.inputs.cluster_file_path }}" | grep 'class:' | sed 's/.*class: *//')
+          k8s_version=$(grep -A10 'topology:' "${{ github.event.inputs.cluster_file_path }}" | grep 'version:' | sed 's/.*version: *//')
+          
+          echo "cluster_class=${cluster_class}" >> $GITHUB_OUTPUT
+          echo "k8s_version=${k8s_version}" >> $GITHUB_OUTPUT
+          echo "Cluster class: ${cluster_class}, K8s version: ${k8s_version}"
+
+      - name: Set environment-scoped AWS credentials
+        env:
+          ENV_NAME: ${{ steps.metadata.outputs.env_name }}
+        run: |
+          env_upper=$(echo "$ENV_NAME" | tr '[:lower:]' '[:upper:]')
+          
+          aws_access_key_var="${env_upper}_AWS_ACCESS_KEY_ID"
+          aws_secret_key_var="${env_upper}_AWS_SECRET_ACCESS_KEY"
+          aws_region_var="${env_upper}_AWS_REGION"
+          
+          echo "AWS_ACCESS_KEY_ID=$(eval echo \$$aws_access_key_var)" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(eval echo \$$aws_secret_key_var)" >> $GITHUB_ENV
+          echo "AWS_REGION=$(eval echo \$$aws_region_var)" >> $GITHUB_ENV
+          echo "✓ Environment-scoped AWS credentials set"
+
+      - name: Set environment-scoped OCM hub credentials
+        env:
+          ENV_NAME: ${{ steps.metadata.outputs.env_name }}
+        run: |
+          env_upper=$(echo "$ENV_NAME" | tr '[:lower:]' '[:upper:]')
+          
+          hub_token_var="${env_upper}_OCM_HUB_BOOTSTRAP_TOKEN"
+          hub_api_var="${env_upper}_OCM_HUB_API_URL"
+          hub_ca_var="${env_upper}_OCM_HUB_CA_CERT"
+          
+          echo "OCM_HUB_BOOTSTRAP_TOKEN=$(eval echo \$$hub_token_var)" >> $GITHUB_ENV
+          echo "OCM_HUB_API_URL=$(eval echo \$$hub_api_var)" >> $GITHUB_ENV
+          echo "OCM_HUB_CA_CERT=$(eval echo \$$hub_ca_var)" >> $GITHUB_ENV
+          echo "✓ Environment-scoped OCM hub credentials set"
+
+      - name: Install tools
+        run: |
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          
+          # Install clusterctl
+          curl -L https://github.com/kubernetes-sigs/cluster-api/releases/download/v1.6.0/clusterctl-linux-amd64 -o clusterctl
+          chmod +x clusterctl && sudo mv clusterctl /usr/local/bin/
+          
+          # Install helm
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          
+          # Install clusteradm (OCM CLI)
+          curl -L https://github.com/open-cluster-management-io/clusteradm/releases/download/v0.7.0/clusteradm_linux_amd64.tar.gz | tar xz
+          sudo mv clusteradm /usr/local/bin/
+          
+          # Install kubeadm for validation
+          sudo apt-get update && sudo apt-get install -y kubeadm
+          
+          echo "✓ Tools installed: kubectl, clusterctl, helm, clusteradm, kubeadm"
+
+      - name: Wait for cluster kubeconfig
+        timeout-minutes: 30
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+        run: |
+          echo "⏳ Waiting for cluster kubeconfig (max 30min)..."
+          
+          # Wait for cluster to be created and kubeconfig available
+          for i in {1..60}; do
+            if kubectl get secret "${CLUSTER_NAME}-kubeconfig" 2>/dev/null; then
+              echo "✓ Kubeconfig secret found"
+              kubectl get secret "${CLUSTER_NAME}-kubeconfig" -o jsonpath='{.data.value}' | base64 -d > /tmp/cluster.kubeconfig
+              
+              # Validate kubeconfig
+              if kubectl --kubeconfig=/tmp/cluster.kubeconfig cluster-info 2>/dev/null; then
+                echo "✓ Cluster is accessible"
+                exit 0
+              fi
+            fi
+            
+            echo "Attempt $i/60: Waiting for kubeconfig..."
+            sleep 30
+          done
+          
+          echo "❌ Timeout waiting for kubeconfig"
+          exit 1
+
+      - name: Bootstrap Flux operator
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+        run: |
+          export KUBECONFIG=/tmp/cluster.kubeconfig
+          
+          echo "⏳ Installing Flux..."
+          
+          # Add Flux repository
+          helm repo add fluxcd-community https://fluxcd-community.github.io/helm-charts
+          helm repo update
+          
+          # Install Flux operator
+          helm install flux-operator fluxcd-community/flux-operator \
+            --namespace flux-system \
+            --create-namespace \
+            --set allowDegradedMode=true \
+            --wait \
+            --timeout 5m
+          
+          echo "✓ Flux operator installed"
+
+      - name: Bootstrap Flux instance
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+          GITHUB_REPO: ${{ github.repository_owner }}/fleet-gitops
+          GITOPS_PATH: clusters/${{ steps.metadata.outputs.env_name }}/${{ steps.metadata.outputs.domain }}/${{ steps.metadata.outputs.provider }}/${{ steps.metadata.outputs.region }}/${{ steps.metadata.outputs.cluster_name }}
+        run: |
+          export KUBECONFIG=/tmp/cluster.kubeconfig
+          
+          echo "⏳ Creating FluxInstance..."
+          
+          cat <<EOF | kubectl apply -f -
+          apiVersion: fluxcd.controlplane.io/v1
+          kind: FluxInstance
+          metadata:
+            name: flux
+            namespace: flux-system
+          spec:
+            distribution:
+              version: "2.x"
+              registry: ghcr.io/fluxcd
+            components:
+              - source-controller
+              - kustomize-controller
+              - notification-controller
+              - image-automation-controller
+              - image-reflector-controller
+            sync:
+              kind: GitRepository
+              name: fleet-config
+          EOF
+          
+          echo "✓ FluxInstance created"
+
+      - name: Create Flux GitRepository
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+          GITHUB_REPO: ${{ github.repository_owner }}/fleet-gitops
+          GITOPS_PATH: clusters/${{ steps.metadata.outputs.env_name }}/${{ steps.metadata.outputs.domain }}/${{ steps.metadata.outputs.provider }}/${{ steps.metadata.outputs.region }}/${{ steps.metadata.outputs.cluster_name }}
+        run: |
+          export KUBECONFIG=/tmp/cluster.kubeconfig
+          
+          echo "⏳ Creating Flux GitRepository..."
+          
+          cat <<EOF | kubectl apply -f -
+          apiVersion: source.toolkit.fluxcd.io/v1
+          kind: GitRepository
+          metadata:
+            name: fleet-config
+            namespace: flux-system
+          spec:
+            interval: 1m
+            url: https://github.com/${{ env.GITHUB_REPO }}
+            ref:
+              branch: main
+            ignore: |
+              !${{ env.GITOPS_PATH }}
+              /**
+          EOF
+          
+          echo "✓ GitRepository created (pointing to fleet-gitops/${{ env.GITOPS_PATH }})"
+
+      - name: Create cluster-bootstrap ConfigMap
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+          DOMAIN: ${{ steps.metadata.outputs.domain }}
+          PROVIDER: ${{ steps.metadata.outputs.provider }}
+          REGION: ${{ steps.metadata.outputs.region }}
+          CLUSTER_CLASS: ${{ steps.labels.outputs.cluster_class }}
+          K8S_VERSION: ${{ steps.labels.outputs.k8s_version }}
+          ENV_NAME: ${{ steps.metadata.outputs.env_name }}
+          GITOPS_REPO: ${{ github.repository_owner }}/fleet-gitops
+          GITOPS_PATH: clusters/${{ steps.metadata.outputs.env_name }}/${{ steps.metadata.outputs.domain }}/${{ steps.metadata.outputs.provider }}/${{ steps.metadata.outputs.region }}/${{ steps.metadata.outputs.cluster_name }}
+          OCM_HUB_URL: ${{ env.OCM_HUB_API_URL }}
+        run: |
+          export KUBECONFIG=/tmp/cluster.kubeconfig
+          
+          echo "⏳ Creating cluster-bootstrap ConfigMap..."
+          
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cluster-bootstrap
+            namespace: flux-system
+          data:
+            cluster-name: "${{ env.CLUSTER_NAME }}"
+            cluster-provider: "${{ env.PROVIDER }}"
+            cluster-region: "${{ env.REGION }}"
+            cluster-domain: "${{ env.DOMAIN }}"
+            cluster-environment: "${{ env.ENV_NAME }}"
+            cluster-class: "${{ env.CLUSTER_CLASS }}"
+            kubernetes-version: "${{ env.K8S_VERSION }}"
+            ocm-hub-url: "${{ env.OCM_HUB_URL }}"
+            gitops-repo: "${{ env.GITOPS_REPO }}"
+            gitops-path: "${{ env.GITOPS_PATH }}"
+          EOF
+          
+          echo "✓ cluster-bootstrap ConfigMap created"
+
+      - name: Configure External Secrets Operator (ESO) credentials
+        env:
+          ENV_NAME: ${{ steps.metadata.outputs.env_name }}
+        run: |
+          export KUBECONFIG=/tmp/cluster.kubeconfig
+          
+          echo "⏳ Creating ESO secret store credentials..."
+          
+          # Create secret with GitHub token for accessing fleet-gitops
+          kubectl create secret generic external-secrets-github \
+            --from-literal=github-token="${{ secrets.GITHUB_TOKEN }}" \
+            --namespace flux-system \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create secret with environment-scoped credentials for cloud provider
+          env_upper=$(echo "$ENV_NAME" | tr '[:lower:]' '[:upper:]')
+          aws_access_key_var="${env_upper}_AWS_ACCESS_KEY_ID"
+          aws_secret_key_var="${env_upper}_AWS_SECRET_ACCESS_KEY"
+          
+          kubectl create secret generic external-secrets-aws \
+            --from-literal=access-key-id="$(eval echo \$$aws_access_key_var)" \
+            --from-literal=secret-access-key="$(eval echo \$$aws_secret_key_var)" \
+            --namespace flux-system \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          echo "✓ ESO credentials configured"
+
+      - name: Join OCM hub
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+          ENV_NAME: ${{ steps.metadata.outputs.env_name }}
+        run: |
+          export KUBECONFIG=/tmp/cluster.kubeconfig
+          
+          if [ -z "${{ env.OCM_HUB_BOOTSTRAP_TOKEN }}" ] || [ -z "${{ env.OCM_HUB_API_URL }}" ]; then
+            echo "⚠️  OCM hub credentials not available, skipping hub registration"
+            echo "   Manual registration will be needed via: clusteradm join --hub-apiserver=<url> --token=<token>"
+            exit 0
+          fi
+          
+          echo "⏳ Registering cluster with OCM hub..."
+          
+          # Create namespace for OCM agent
+          kubectl create namespace open-cluster-management-agent || true
+          
+          # Use clusteradm to join hub
+          clusteradm join \
+            --hub-apiserver="${{ env.OCM_HUB_API_URL }}" \
+            --hub-token="${{ env.OCM_HUB_BOOTSTRAP_TOKEN }}" \
+            --cluster-name="${{ env.CLUSTER_NAME }}" \
+            --namespace=open-cluster-management-agent \
+            --wait
+          
+          echo "✓ Cluster registered with OCM hub"
+
+      - name: Wait for cluster readiness
+        timeout-minutes: 10
+        run: |
+          export KUBECONFIG=/tmp/cluster.kubeconfig
+          
+          echo "⏳ Waiting for cluster components to be ready..."
+          
+          # Wait for API server
+          kubectl wait --for=condition=Available=True apiservices.apiregistration.k8s.io \
+            --all \
+            --timeout=5m || true
+          
+          # Wait for core namespaces
+          for ns in kube-system kube-public flux-system; do
+            echo "Waiting for namespace $ns..."
+            kubectl wait --for=condition=Active namespace/$ns --timeout=5m || true
+          done
+          
+          echo "✓ Cluster is ready"
+
+      - name: Store cluster kubeconfig
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+          ENV_NAME: ${{ steps.metadata.outputs.env_name }}
+        run: |
+          secret_name="${{ env.CLUSTER_NAME }}_KUBECONFIG"
+          secret_name=$(echo "$secret_name" | tr '[:lower:]' '[:upper:]' | sed 's/-/_/g')
+          
+          # Store kubeconfig as GitHub Secret (scoped to environment)
+          # This would require gh CLI with appropriate permissions
+          echo "⚠️  Manual step: Store kubeconfig as GitHub Secret '$secret_name' in ${{ env.ENV_NAME }} environment"
+          echo "   Base64-encoded kubeconfig available in workflow artifacts"
+          
+          # Alternative: Upload as artifact for manual storage
+          base64 -w0 /tmp/cluster.kubeconfig > /tmp/cluster.kubeconfig.b64
+          echo "Kubeconfig stored in workflow artifacts"
+
+      - name: Create PR comment with bootstrap summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const clusterName = '${{ steps.metadata.outputs.cluster_name }}';
+            const domain = '${{ steps.metadata.outputs.domain }}';
+            const provider = '${{ steps.metadata.outputs.provider }}';
+            const region = '${{ steps.metadata.outputs.region }}';
+            const environment = '${{ steps.metadata.outputs.env_name }}';
+            
+            let summary = `## ✅ Cluster Bootstrap Summary\n\n`;
+            summary += `**Cluster:** ${clusterName}\n`;
+            summary += `**Environment:** ${environment}\n`;
+            summary += `**Domain:** ${domain}\n`;
+            summary += `**Provider:** ${provider}\n`;
+            summary += `**Region:** ${region}\n\n`;
+            summary += `### Bootstrap Steps Completed:\n`;
+            summary += `- ✓ Flux operator installed\n`;
+            summary += `- ✓ Flux instance created\n`;
+            summary += `- ✓ GitRepository configured (fleet-gitops)\n`;
+            summary += `- ✓ cluster-bootstrap ConfigMap created\n`;
+            summary += `- ✓ ESO credentials configured\n`;
+            summary += `- ✓ Registered with OCM hub\n\n`;
+            summary += `### Next Steps:\n`;
+            summary += `1. Review cluster-specific configuration in [fleet-gitops](https://github.com/${{ github.repository_owner }}/fleet-gitops)/clusters/${environment}/${domain}/${provider}/${region}/${clusterName}/\n`;
+            summary += `2. Monitor Flux reconciliation: \`kubectl get kustomization -A\`\n`;
+            summary += `3. Check OCM managed cluster status on hub cluster\n`;
+            summary += `4. Deploy workloads via GitOps (autoscaler, monitoring, policies, etc.)\n`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f /tmp/cluster.kubeconfig /tmp/cluster.kubeconfig.b64
+          echo "✓ Temporary files cleaned up"

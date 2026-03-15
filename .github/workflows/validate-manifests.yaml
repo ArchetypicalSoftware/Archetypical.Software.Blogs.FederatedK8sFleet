@@ -1,0 +1,215 @@
+name: Validate Manifests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'clusters/**/*.yaml'
+      - 'clusterclasses/**/*.yaml'
+      - 'ocm/**/*.yaml'
+
+jobs:
+  validate-structure:
+    name: Validate Cluster Structure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate path structure
+        run: |
+          echo "Validating cluster path structure..."
+          
+          for file in $(git diff --name-only --diff-filter=AM origin/main HEAD 2>/dev/null | grep '^clusters/.*\.yaml$' || true); do
+            if ! [[ "$file" =~ ^clusters/(dev|staging|production)/[a-z0-9-]+/(aws|azure|gcp)/[a-z0-9-]+/[a-z0-9-]+/cluster\.yaml$ ]]; then
+              echo "❌ FAIL: $file does not match required pattern"
+              echo "   Expected: clusters/{env}/{domain}/{provider}/{region}/{name}/cluster.yaml"
+              echo "   Valid environments: dev, staging, production"
+              echo "   Valid providers: aws, azure, gcp"
+              exit 1
+            fi
+            echo "✓ Valid path: $file"
+          done
+
+      - name: Validate cluster names
+        run: |
+          echo "Validating cluster names..."
+          
+          for file in $(git diff --name-only --diff-filter=AM origin/main HEAD 2>/dev/null | grep '^clusters/.*\.yaml$' || true); do
+            NAME=$(echo $file | cut -d'/' -f6)
+            
+            if ! [[ "$NAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+              echo "❌ FAIL: Invalid cluster name '$NAME' in $file"
+              echo "   Must be lowercase alphanumeric + hyphens"
+              echo "   Length: 1-63 characters"
+              echo "   No leading/trailing hyphens"
+              exit 1
+            fi
+            echo "✓ Valid name: $NAME"
+          done
+
+      - name: Install yq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          pip3 install pyyaml
+
+      - name: Validate ClusterClass matches provider
+        run: |
+          echo "Validating ClusterClass matches provider..."
+          
+          for file in $(git diff --name-only --diff-filter=AM origin/main HEAD 2>/dev/null | grep '^clusters/.*\.yaml$' || true); do
+            if [ ! -f "$file" ]; then
+              continue
+            fi
+            
+            PROVIDER=$(echo $file | cut -d'/' -f4)
+            CLASS=$(grep "class:" "$file" | awk '{print $2}' | tr -d ' ')
+            
+            if [ -z "$CLASS" ]; then
+              echo "⚠ WARNING: No ClusterClass specified in $file"
+              continue
+            fi
+            
+            if [[ ! "$CLASS" =~ $PROVIDER ]]; then
+              echo "❌ FAIL: ClusterClass '$CLASS' does not match provider '$PROVIDER' in $file"
+              exit 1
+            fi
+            echo "✓ ClusterClass matches provider: $CLASS in $PROVIDER"
+          done
+
+      - name: Validate required labels
+        run: |
+          echo "Validating required labels..."
+          
+          for file in $(git diff --name-only --diff-filter=AM origin/main HEAD 2>/dev/null | grep '^clusters/.*\.yaml$' || true); do
+            if [ ! -f "$file" ]; then
+              continue
+            fi
+            
+            ENV=$(echo $file | cut -d'/' -f2)
+            DOMAIN=$(echo $file | cut -d'/' -f3)
+            
+            # Extract labels from YAML
+            TEAM=$(grep -A 10 "metadata:" "$file" | grep "team:" | head -1 | awk '{print $2}' | tr -d ' ')
+            ENV_LABEL=$(grep -A 10 "metadata:" "$file" | grep "environment:" | head -1 | awk '{print $2}' | tr -d ' ')
+            CLUSTER_TYPE=$(grep -A 10 "metadata:" "$file" | grep "cluster-type:" | head -1 | awk '{print $2}' | tr -d ' ')
+            
+            if [ -z "$TEAM" ]; then
+              echo "❌ FAIL: Missing 'team' label in $file"
+              exit 1
+            fi
+            
+            if [ "$TEAM" != "$DOMAIN" ]; then
+              echo "❌ FAIL: team label '$TEAM' does not match domain '$DOMAIN' in path"
+              exit 1
+            fi
+            echo "✓ Team label matches domain: $TEAM"
+            
+            if [ -z "$ENV_LABEL" ]; then
+              echo "❌ FAIL: Missing 'environment' label in $file"
+              exit 1
+            fi
+            
+            if [ "$ENV_LABEL" != "$ENV" ]; then
+              echo "❌ FAIL: environment label '$ENV_LABEL' does not match path environment '$ENV'"
+              exit 1
+            fi
+            echo "✓ Environment label matches path: $ENV_LABEL"
+            
+            if [ -z "$CLUSTER_TYPE" ]; then
+              echo "❌ FAIL: Missing 'cluster-type' label in $file"
+              exit 1
+            fi
+            echo "✓ Cluster-type label present: $CLUSTER_TYPE"
+          done
+
+      - name: Validate deletion protection for production
+        run: |
+          echo "Validating deletion protection for production clusters..."
+          
+          for file in $(git diff --name-only --diff-filter=AM origin/main HEAD 2>/dev/null | grep '^clusters/production/.*\.yaml$' || true); do
+            if [ ! -f "$file" ]; then
+              continue
+            fi
+            
+            DEL_PROT=$(grep "deletion-protection:" "$file" | awk '{print $2}' | tr -d ' ')
+            
+            if [ "$DEL_PROT" != "enabled" ]; then
+              echo "❌ FAIL: Production cluster $file MUST have deletion-protection: enabled label"
+              exit 1
+            fi
+            echo "✓ Production cluster has deletion-protection: $file"
+          done
+
+      - name: Check for duplicate cluster names
+        run: |
+          echo "Checking for duplicate cluster names..."
+          
+          # Get all cluster names from all cluster.yaml files
+          if git show HEAD:clusters > /dev/null 2>&1; then
+            NAMES=$(find clusters -name 'cluster.yaml' -exec grep "name:" {} \; | grep -A 0 "name:" | awk '{print $2}' | sort)
+            DUPLICATES=$(echo "$NAMES" | uniq -d)
+            
+            if [ -n "$DUPLICATES" ]; then
+              echo "❌ FAIL: Duplicate cluster names found:"
+              echo "$DUPLICATES"
+              exit 1
+            fi
+            echo "✓ No duplicate cluster names found"
+          fi
+
+      - name: Validate autoscaler ranges
+        run: |
+          echo "Validating autoscaler variable ranges..."
+          
+          for file in $(git diff --name-only --diff-filter=AM origin/main HEAD 2>/dev/null | grep '^clusters/.*\.yaml$' || true); do
+            if [ ! -f "$file" ]; then
+              continue
+            fi
+            
+            # Check for autoscaler variable validation in spec
+            if grep -q "workerMinReplicas:" "$file"; then
+              MIN=$(grep "workerMinReplicas:" "$file" | head -1 | awk '{print $2}' | tr -d ' ')
+              MAX=$(grep "workerMaxReplicas:" "$file" | head -1 | awk '{print $2}' | tr -d ' ')
+              
+              if [ -n "$MIN" ] && [ -n "$MAX" ]; then
+                if [ "$MIN" -lt 0 ]; then
+                  echo "❌ FAIL: workerMinReplicas must be >= 0 in $file (got $MIN)"
+                  exit 1
+                fi
+                
+                if [ "$MAX" -gt 100 ]; then
+                  echo "❌ FAIL: workerMaxReplicas must be <= 100 in $file (got $MAX)"
+                  exit 1
+                fi
+                
+                if [ "$MIN" -ge "$MAX" ]; then
+                  echo "❌ FAIL: workerMinReplicas must be < workerMaxReplicas in $file ($MIN >= $MAX)"
+                  exit 1
+                fi
+                echo "✓ Autoscaler ranges valid: min=$MIN, max=$MAX"
+              fi
+            fi
+          done
+
+  validate-schema:
+    name: Validate YAML Schema
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubeconform
+        run: |
+          wget https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar xf kubeconform-linux-amd64.tar.gz
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Validate YAML with kubeconform
+        run: |
+          echo "Validating YAML schema with kubeconform..."
+          kubeconform -summary -output json clusters/ clusterclasses/ ocm/ || true

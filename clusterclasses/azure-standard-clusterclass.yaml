@@ -1,0 +1,184 @@
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: ClusterClass
+metadata:
+  name: azure-standard
+  namespace: default
+spec:
+  infrastructure:
+    ref:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: AzureClusterTemplate
+      name: azure-standard-cluster-template
+  controlPlane:
+    ref:
+      apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+      kind: KubeadmControlPlaneTemplate
+      name: azure-standard-controlplane-template
+    machineInfrastructure:
+      ref:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: AzureMachineTemplate
+        name: azure-standard-controlplane-machinetemplate
+  workers:
+    machineDeployments:
+      - class: default-worker
+        template:
+          bootstrap:
+            ref:
+              apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+              kind: KubeadmConfigTemplate
+              name: azure-standard-worker-bootstrap-template
+          infrastructure:
+            ref:
+              apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+              kind: AzureMachineTemplate
+              name: azure-standard-worker-machinetemplate
+  variables:
+    - name: location
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: string
+          description: Azure region (e.g., eastus, westeurope)
+    
+    - name: controlPlaneMachineType
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: Standard_D4s_v3
+          description: Azure VM size for control plane
+    
+    - name: workerMachineType
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: Standard_D4s_v3
+          description: Azure VM size for worker nodes
+    
+    - name: workerMinReplicas
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: integer
+          default: 1
+          minimum: 0
+          description: Minimum worker replicas for autoscaling
+    
+    - name: workerMaxReplicas
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: integer
+          default: 10
+          minimum: 1
+          maximum: 100
+          description: Maximum worker replicas for autoscaling
+    
+    - name: autoscalerEnabled
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: boolean
+          default: true
+          description: Enable cluster autoscaler
+    
+    - name: kubernetesVersion
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: string
+          description: Kubernetes version (e.g., v1.30.0)
+  
+  patches:
+    # Location patch
+    - name: azure-location
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: AzureClusterTemplate
+          jsonPatches:
+            - op: replace
+              path: "/spec/template/spec/location"
+              valueFrom:
+                variable: location
+    
+    # Control plane machine type
+    - name: controlplane-machine-type
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: AzureMachineTemplate
+            matchResources:
+              controlPlane: true
+          jsonPatches:
+            - op: replace
+              path: "/spec/template/spec/vmSize"
+              valueFrom:
+                variable: controlPlaneMachineType
+    
+    # Worker machine type
+    - name: worker-machine-type
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: AzureMachineTemplate
+            matchResources:
+              machineDeploymentClass:
+                names: ["default-worker"]
+          jsonPatches:
+            - op: replace
+              path: "/spec/template/spec/vmSize"
+              valueFrom:
+                variable: workerMachineType
+    
+    # Kubernetes version
+    - name: kubernetes-version
+      definitions:
+        - selector:
+            apiVersion: cluster.x-k8s.io/v1beta1
+            kind: Cluster
+          jsonPatches:
+            - op: replace
+              path: "/spec/topology/version"
+              valueFrom:
+                variable: kubernetesVersion
+    
+    # Autoscaler annotations
+    - name: autoscaler-annotations
+      enabledIf: "{{ if .autoscalerEnabled }}true{{ end }}"
+      definitions:
+        - selector:
+            apiVersion: cluster.x-k8s.io/v1beta1
+            kind: MachineDeployment
+            matchResources:
+              machineDeploymentClass:
+                names: ["default-worker"]
+          jsonPatches:
+            - op: add
+              path: "/spec/template/metadata/annotations"
+              valueFrom:
+                template: |
+                  cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "{{ .workerMinReplicas }}"
+                  cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "{{ .workerMaxReplicas }}"
+    
+    # Azure autoscaler tags
+    - name: azure-autoscaler-tags
+      enabledIf: "{{ if .autoscalerEnabled }}true{{ end }}"
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: AzureMachineTemplate
+            matchResources:
+              machineDeploymentClass:
+                names: ["default-worker"]
+          jsonPatches:
+            - op: add
+              path: "/spec/template/spec/tags"
+              valueFrom:
+                template: |
+                  cluster-autoscaler-enabled: "true"
+                  cluster-autoscaler-name: "{{ .builtin.cluster.name }}"
+                  managed-by: "capi"
+                  gitops-repo: "fleet-gitops"

@@ -1,0 +1,39 @@
+# GitHub CODEOWNERS - Path-based approval rules
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owners for everything in the repo
+* @ArchetypicalSoftware/platform-team
+
+# ClusterClass definitions require platform + SRE teams
+/clusterclasses/** @ArchetypicalSoftware/platform-team @ArchetypicalSoftware/sre-team
+
+# OCM hub configuration requires platform + security teams
+/ocm/hubs/** @ArchetypicalSoftware/platform-team @ArchetypicalSoftware/security-team
+
+# OCM policies and placements
+/ocm/policies/** @ArchetypicalSoftware/platform-team @ArchetypicalSoftware/security-team
+/ocm/placements/** @ArchetypicalSoftware/platform-team
+
+# GitHub workflows require platform team approval
+/.github/workflows/** @ArchetypicalSoftware/platform-team
+
+# Production clusters require platform + security approval
+/clusters/production/** @ArchetypicalSoftware/platform-team @ArchetypicalSoftware/security-team
+
+# Staging clusters require platform team approval
+/clusters/staging/** @ArchetypicalSoftware/platform-team
+
+# Dev clusters require developers approval
+/clusters/dev/** @ArchetypicalSoftware/developers
+
+# Domain-specific overrides
+/clusters/**/management/** @ArchetypicalSoftware/platform-team
+/clusters/**/platform/** @ArchetypicalSoftware/platform-team
+/clusters/**/logging/** @ArchetypicalSoftware/logging-team
+/clusters/**/payments/** @ArchetypicalSoftware/payments-team @ArchetypicalSoftware/security-team
+
+# Scripts require platform team review
+/scripts/** @ArchetypicalSoftware/platform-team
+
+# Documentation can be approved by any team member
+*.md @ArchetypicalSoftware/platform-team

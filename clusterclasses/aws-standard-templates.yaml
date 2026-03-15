@@ -1,0 +1,95 @@
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AWSClusterTemplate
+metadata:
+  name: aws-standard-cluster-template
+  namespace: default
+spec:
+  template:
+    spec:
+      region: us-east-1  # Overridden by patch
+      network:
+        vpc:
+          cidrBlock: "10.0.0.0/16"
+        subnets:
+          - cidrBlock: "10.0.1.0/24"
+            availabilityZone: "us-east-1a"
+            isPublic: true
+          - cidrBlock: "10.0.2.0/24"
+            availabilityZone: "us-east-1b"
+            isPublic: true
+          - cidrBlock: "10.0.3.0/24"
+            availabilityZone: "us-east-1c"
+            isPublic: false
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlaneTemplate
+metadata:
+  name: aws-standard-controlplane-template
+  namespace: default
+spec:
+  template:
+    spec:
+      kubeadmConfigSpec:
+        clusterConfiguration:
+          apiServer:
+            extraArgs:
+              cloud-provider: aws
+          controllerManager:
+            extraArgs:
+              cloud-provider: aws
+        initConfiguration:
+          nodeRegistration:
+            kubeletExtraArgs:
+              cloud-provider: aws
+        joinConfiguration:
+          nodeRegistration:
+            kubeletExtraArgs:
+              cloud-provider: aws
+      machineTemplate:
+        infrastructureRef:
+          apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+          kind: AWSMachineTemplate
+          name: aws-standard-controlplane-machinetemplate
+      replicas: 3
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AWSMachineTemplate
+metadata:
+  name: aws-standard-controlplane-machinetemplate
+  namespace: default
+spec:
+  template:
+    spec:
+      instanceType: m5.large  # Overridden by patch
+      iamInstanceProfile: "control-plane.cluster-api-provider-aws.sigs.k8s.io"
+      rootVolume:
+        size: 80
+        type: gp3
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+kind: AWSMachineTemplate
+metadata:
+  name: aws-standard-worker-machinetemplate
+  namespace: default
+spec:
+  template:
+    spec:
+      instanceType: m5.large  # Overridden by patch
+      iamInstanceProfile: "nodes.cluster-api-provider-aws.sigs.k8s.io"
+      rootVolume:
+        size: 80
+        type: gp3
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: KubeadmConfigTemplate
+metadata:
+  name: aws-standard-worker-bootstrap-template
+  namespace: default
+spec:
+  template:
+    spec:
+      joinConfiguration:
+        nodeRegistration:
+          kubeletExtraArgs:
+            cloud-provider: aws

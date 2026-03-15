@@ -1,0 +1,246 @@
+name: Bootstrap OCM Hub
+
+on:
+  workflow_dispatch:
+    inputs:
+      hub_cluster_file:
+        description: 'Path to hub cluster.yaml (e.g., clusters/dev/management/aws/us-east-1/dev-hub/cluster.yaml)'
+        required: true
+        type: string
+      environment:
+        description: 'Environment (dev, staging, production)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+jobs:
+  bootstrap-ocm-hub:
+    name: Bootstrap OCM Hub Cluster
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Parse hub metadata from path
+        id: metadata
+        run: |
+          FILE="${{ github.event.inputs.hub_cluster_file }}"
+          ENV="${{ github.event.inputs.environment }}"
+          
+          if [ ! -f "$FILE" ]; then
+            echo "❌ File not found: $FILE"
+            exit 1
+          fi
+          
+          # Parse path: clusters/{env}/management/{provider}/{region}/{name}/cluster.yaml
+          PROVIDER=$(echo "$FILE" | cut -d'/' -f4)
+          REGION=$(echo "$FILE" | cut -d'/' -f5)
+          HUB_NAME=$(echo "$FILE" | cut -d'/' -f6)
+          
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "provider=$PROVIDER" >> $GITHUB_OUTPUT
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+          echo "hub_name=$HUB_NAME" >> $GITHUB_OUTPUT
+          echo "cluster_file=$FILE" >> $GITHUB_OUTPUT
+
+      - name: Set AWS credentials
+        if: steps.metadata.outputs.provider == 'aws'
+        run: |
+          ENV_UPPER=$(echo "${{ steps.metadata.outputs.environment }}" | tr '[:lower:]' '[:upper:]')
+          
+          echo "AWS_ACCESS_KEY_ID=${{ secrets[format('{0}_AWS_ACCESS_KEY_ID', env.ENV_UPPER)] }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets[format('{0}_AWS_SECRET_ACCESS_KEY', env.ENV_UPPER)] }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=${{ steps.metadata.outputs.region }}" >> $GITHUB_ENV
+
+      - name: Install required tools
+        run: |
+          echo "Installing Kubernetes tools..."
+          
+          # kind
+          curl -Lo kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
+          chmod +x kind && sudo mv kind /usr/local/bin/
+          
+          # kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          
+          # clusterctl
+          curl -L https://github.com/kubernetes-sigs/cluster-api/releases/latest/download/clusterctl-linux-amd64 -o clusterctl
+          chmod +x clusterctl && sudo mv clusterctl /usr/local/bin/
+          
+          # clusteradm (OCM)
+          curl -L https://raw.githubusercontent.com/open-cluster-management-io/clusteradm/main/install.sh | bash
+          
+          echo "✓ All tools installed"
+
+      - name: Create kind bootstrap cluster
+        run: |
+          echo "Creating kind bootstrap cluster..."
+          kind create cluster --name ocm-hub-bootstrap
+          kubectl cluster-info
+          echo "✓ Bootstrap cluster created"
+
+      - name: Init CAPI on bootstrap cluster
+        run: |
+          echo "Initializing CAPI on bootstrap cluster..."
+          clusterctl init \
+            --infrastructure ${{ steps.metadata.outputs.provider }} \
+            --bootstrap kubeadm \
+            --control-plane kubeadm
+          echo "✓ CAPI initialized"
+
+      - name: Apply ClusterClass and templates
+        run: |
+          echo "Applying OCM hub ClusterClass..."
+          kubectl apply -f clusterclasses/ocm-hub-clusterclass.yaml
+          kubectl apply -f clusterclasses/ocm-hub-templates.yaml
+          echo "✓ ClusterClass applied"
+
+      - name: Apply hub cluster manifest
+        run: |
+          echo "Applying hub cluster manifest..."
+          kubectl apply -f ${{ steps.metadata.outputs.cluster_file }}
+          echo "✓ Cluster manifest applied"
+
+      - name: Wait for hub cluster kubeconfig
+        run: |
+          echo "Waiting for hub cluster kubeconfig (timeout: 30 minutes)..."
+          
+          for i in {1..60}; do
+            if clusterctl get kubeconfig ${{ steps.metadata.outputs.hub_name }} > hub.kubeconfig 2>/dev/null; then
+              echo "✓ Got hub kubeconfig on attempt $i"
+              exit 0
+            fi
+            echo "Waiting... (attempt $i/60)"
+            sleep 30
+          done
+          
+          echo "❌ Timed out waiting for kubeconfig"
+          exit 1
+
+      - name: Init CAPI on hub cluster (self-managed)
+        run: |
+          echo "Initializing CAPI on hub cluster (self-managed)..."
+          clusterctl init \
+            --kubeconfig hub.kubeconfig \
+            --infrastructure ${{ steps.metadata.outputs.provider }} \
+            --bootstrap kubeadm \
+            --control-plane kubeadm
+          echo "✓ CAPI initialized on hub"
+
+      - name: Move CAPI management to hub
+        run: |
+          echo "Moving CAPI management to hub cluster..."
+          clusterctl move --to-kubeconfig hub.kubeconfig
+          echo "✓ CAPI management moved to hub"
+
+      - name: Initialize OCM hub
+        run: |
+          export KUBECONFIG=hub.kubeconfig
+          
+          echo "Initializing OCM hub..."
+          clusteradm init --wait
+          echo "✓ OCM hub initialized"
+          
+          # Apply environment-specific ClusterManager config
+          echo "Applying OCM ClusterManager configuration..."
+          kubectl apply -f ocm/hubs/${{ steps.metadata.outputs.environment }}/clustermanager.yaml
+          echo "✓ OCM ClusterManager applied"
+
+      - name: Extract and store OCM hub secrets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          export KUBECONFIG=hub.kubeconfig
+          
+          ENV_UPPER=$(echo "${{ steps.metadata.outputs.environment }}" | tr '[:lower:]' '[:upper:]')
+          HUB_NAME_UPPER=$(echo "${{ steps.metadata.outputs.hub_name }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          
+          echo "Extracting OCM hub secrets..."
+          
+          # Extract bootstrap token
+          BOOTSTRAP_TOKEN=$(kubectl get secret -n open-cluster-management bootstrap-token-* -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || echo "")
+          
+          # Extract API server URL
+          API_URL=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          
+          # Extract CA certificate
+          CA_CERT=$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+          
+          # Extract cluster manager token
+          MGR_TOKEN=$(kubectl create token -n open-cluster-management cluster-manager --duration=87600h)
+          
+          # Store kubeconfig
+          kubectl config view --minify --flatten > /tmp/hub-kubeconfig
+          
+          # Set GitHub Secrets with environment prefix
+          echo "Storing secrets in GitHub..."
+          gh secret set "${ENV_UPPER}_OCM_HUB_KUBECONFIG" < /tmp/hub-kubeconfig
+          echo -n "$BOOTSTRAP_TOKEN" | gh secret set "${ENV_UPPER}_OCM_HUB_BOOTSTRAP_TOKEN"
+          echo -n "$API_URL" | gh secret set "${ENV_UPPER}_OCM_HUB_API_URL"
+          echo -n "$CA_CERT" | gh secret set "${ENV_UPPER}_OCM_HUB_CA_CERT"
+          echo -n "$MGR_TOKEN" | gh secret set "${ENV_UPPER}_OCM_CLUSTER_MANAGER_TOKEN"
+          
+          rm -f /tmp/hub-kubeconfig
+          
+          echo "✓ OCM secrets stored in GitHub"
+
+      - name: Verify hub is healthy
+        run: |
+          export KUBECONFIG=hub.kubeconfig
+          
+          echo "Verifying hub cluster health..."
+          
+          # Check CAPI controllers
+          echo "CAPI Controllers:"
+          kubectl get pods -n capi-system
+          
+          # Check OCM hub components
+          echo ""
+          echo "OCM Hub Components:"
+          kubectl get pods -n open-cluster-management-hub-system
+          
+          echo "✓ Hub cluster is operational"
+
+      - name: Clean up bootstrap cluster
+        if: always()
+        run: |
+          echo "Cleaning up bootstrap cluster..."
+          kind delete cluster --name ocm-hub-bootstrap
+          echo "✓ Bootstrap cluster deleted"
+
+      - name: Create PR comment with summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const summary = `
+            ## ✅ OCM Hub Bootstrap Summary
+            
+            **Hub:** ${{ steps.metadata.outputs.hub_name }}
+            **Environment:** ${{ steps.metadata.outputs.environment }}
+            **Provider:** ${{ steps.metadata.outputs.provider }}
+            **Region:** ${{ steps.metadata.outputs.region }}
+            
+            ### Generated Secrets
+            The following GitHub Secrets have been created:
+            - \`${{ env.SECRET_PREFIX }}_OCM_HUB_KUBECONFIG\`
+            - \`${{ env.SECRET_PREFIX }}_OCM_HUB_BOOTSTRAP_TOKEN\`
+            - \`${{ env.SECRET_PREFIX }}_OCM_HUB_API_URL\`
+            - \`${{ env.SECRET_PREFIX }}_OCM_HUB_CA_CERT\`
+            - \`${{ env.SECRET_PREFIX }}_OCM_CLUSTER_MANAGER_TOKEN\`
+            
+            These secrets are used by workload cluster bootstrap to register with this OCM hub.
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });

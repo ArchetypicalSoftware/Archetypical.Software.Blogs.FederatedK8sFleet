@@ -1,0 +1,49 @@
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: pilot-1
+  namespace: default
+  labels:
+    team: platform
+    domain: platform
+    environment: dev
+    cluster-type: workload
+    deletion-protection: disabled
+  annotations:
+    description: "Pilot workload cluster for development testing"
+    owner: "platform-team"
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+        - 192.168.0.0/16
+    services:
+      cidrBlocks:
+        - 10.96.0.0/12
+  topology:
+    class: aws-standard-clusterclass
+    version: v1.27.0
+    controlPlaneEndpoint:
+      host: ""
+      port: 6443
+    variables:
+      - name: region
+        value: us-east-1
+      - name: controlPlaneMachineType
+        value: m5.large
+      - name: workerMachineType
+        value: m5.large
+      - name: workerMinReplicas
+        value: 1
+      - name: workerMaxReplicas
+        value: 10
+      - name: autoscalerEnabled
+        value: true
+      - name: scaleDownDelayAfterAdd
+        value: 10m
+      - name: scaleDownUnneededTime
+        value: 10m
+      - name: scaleDownUtilizationThreshold
+        value: "0.5"
+      - name: kubernetesVersion
+        value: v1.27.0

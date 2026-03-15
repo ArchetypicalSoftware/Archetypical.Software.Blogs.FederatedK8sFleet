@@ -1,0 +1,184 @@
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: ClusterClass
+metadata:
+  name: gcp-standard
+  namespace: default
+spec:
+  infrastructure:
+    ref:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: GCPClusterTemplate
+      name: gcp-standard-cluster-template
+  controlPlane:
+    ref:
+      apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+      kind: KubeadmControlPlaneTemplate
+      name: gcp-standard-controlplane-template
+    machineInfrastructure:
+      ref:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: GCPMachineTemplate
+        name: gcp-standard-controlplane-machinetemplate
+  workers:
+    machineDeployments:
+      - class: default-worker
+        template:
+          bootstrap:
+            ref:
+              apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+              kind: KubeadmConfigTemplate
+              name: gcp-standard-worker-bootstrap-template
+          infrastructure:
+            ref:
+              apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+              kind: GCPMachineTemplate
+              name: gcp-standard-worker-machinetemplate
+  variables:
+    - name: region
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: string
+          description: GCP region (e.g., us-central1)
+    
+    - name: controlPlaneMachineType
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: n1-standard-4
+          description: GCP machine type for control plane
+    
+    - name: workerMachineType
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: n1-standard-4
+          description: GCP machine type for worker nodes
+    
+    - name: workerMinReplicas
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: integer
+          default: 1
+          minimum: 0
+          description: Minimum worker replicas for autoscaling
+    
+    - name: workerMaxReplicas
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: integer
+          default: 10
+          minimum: 1
+          maximum: 100
+          description: Maximum worker replicas for autoscaling
+    
+    - name: autoscalerEnabled
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: boolean
+          default: true
+          description: Enable cluster autoscaler
+    
+    - name: kubernetesVersion
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: string
+          description: Kubernetes version (e.g., v1.30.0)
+  
+  patches:
+    # Region patch
+    - name: gcp-region
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: GCPClusterTemplate
+          jsonPatches:
+            - op: replace
+              path: "/spec/template/spec/region"
+              valueFrom:
+                variable: region
+    
+    # Control plane machine type
+    - name: controlplane-machine-type
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: GCPMachineTemplate
+            matchResources:
+              controlPlane: true
+          jsonPatches:
+            - op: replace
+              path: "/spec/template/spec/machineType"
+              valueFrom:
+                variable: controlPlaneMachineType
+    
+    # Worker machine type
+    - name: worker-machine-type
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: GCPMachineTemplate
+            matchResources:
+              machineDeploymentClass:
+                names: ["default-worker"]
+          jsonPatches:
+            - op: replace
+              path: "/spec/template/spec/machineType"
+              valueFrom:
+                variable: workerMachineType
+    
+    # Kubernetes version
+    - name: kubernetes-version
+      definitions:
+        - selector:
+            apiVersion: cluster.x-k8s.io/v1beta1
+            kind: Cluster
+          jsonPatches:
+            - op: replace
+              path: "/spec/topology/version"
+              valueFrom:
+                variable: kubernetesVersion
+    
+    # Autoscaler annotations
+    - name: autoscaler-annotations
+      enabledIf: "{{ if .autoscalerEnabled }}true{{ end }}"
+      definitions:
+        - selector:
+            apiVersion: cluster.x-k8s.io/v1beta1
+            kind: MachineDeployment
+            matchResources:
+              machineDeploymentClass:
+                names: ["default-worker"]
+          jsonPatches:
+            - op: add
+              path: "/spec/template/metadata/annotations"
+              valueFrom:
+                template: |
+                  cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "{{ .workerMinReplicas }}"
+                  cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "{{ .workerMaxReplicas }}"
+    
+    # GCP autoscaler tags
+    - name: gcp-autoscaler-labels
+      enabledIf: "{{ if .autoscalerEnabled }}true{{ end }}"
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: GCPMachineTemplate
+            matchResources:
+              machineDeploymentClass:
+                names: ["default-worker"]
+          jsonPatches:
+            - op: add
+              path: "/spec/template/spec/labels"
+              valueFrom:
+                template: |
+                  cluster-autoscaler-enabled: "true"
+                  cluster-autoscaler-{{ .builtin.cluster.name }}: "owned"
+                  managed-by: "capi"
+                  gitops-repo: "fleet-gitops"

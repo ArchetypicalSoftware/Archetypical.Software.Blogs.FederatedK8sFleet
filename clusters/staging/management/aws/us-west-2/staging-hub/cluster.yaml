@@ -1,0 +1,48 @@
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: staging-hub
+  namespace: default
+  labels:
+    team: platform
+    environment: staging
+    cluster-type: management
+    deletion-protection: disabled
+  annotations:
+    description: "Staging OCM hub cluster"
+    owner: "platform-team"
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+        - 192.168.0.0/16
+    services:
+      cidrBlocks:
+        - 10.96.0.0/12
+  topology:
+    class: ocm-hub-clusterclass
+    version: v1.27.0
+    controlPlaneEndpoint:
+      host: ""
+      port: 6443
+    variables:
+      - name: region
+        value: us-west-2
+      - name: hubRole
+        value: primary
+      - name: environment
+        value: staging
+      - name: controlPlaneMachineType
+        value: t3.medium
+      - name: workerMachineType
+        value: t3.large
+      - name: workerReplicas
+        value: 3
+      - name: workerMinReplicas
+        value: 3
+      - name: workerMaxReplicas
+        value: 5
+      - name: autoscalerEnabled
+        value: false
+      - name: kubernetesVersion
+        value: v1.27.0

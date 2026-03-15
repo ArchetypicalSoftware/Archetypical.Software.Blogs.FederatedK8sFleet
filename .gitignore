@@ -1,0 +1,55 @@
+# Kubernetes kubeconfig files
+*.kubeconfig
+kubeconfig
+remote.kubeconfig
+hub.kubeconfig
+
+# kind configuration
+kind-config.yaml
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment files
+.env
+.envrc
+
+# Terraform state (if used)
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Logs
+*.log
+logs/
+
+# Build artifacts
+bin/
+dist/
+build/
+
+# Secrets (double-check nothing is committed)
+secrets/
+*.pem
+*.key
+*.crt
+
+# GitHub CLI
+.gh-token

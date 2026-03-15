@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hub-topology
+  namespace: ocm-system
+  labels:
+    app: ocm-fleet-management
+data:
+  topology.yaml: |
+    # Multi-hub OCM topology for Archetypical Fleet Management
+    # Active-passive federation for production high availability
+    
+    hubs:
+      - name: dev-hub
+        environment: dev
+        provider: aws
+        region: us-east-1
+        role: primary
+        capacity: <10
+        sizing:
+          controlPlane: 3
+          workers: 2
+          autoscale: false
+        description: Development environment hub for testing and prototyping
+      
+      - name: staging-hub
+        environment: staging
+        provider: aws
+        region: us-west-2
+        role: primary
+        capacity: <50
+        sizing:
+          controlPlane: 3
+          workers: 3
+          autoscale: true
+          workerMin: 3
+          workerMax: 5
+        description: Staging environment hub for pre-production validation
+      
+      - name: production-hub-primary
+        environment: production
+        provider: aws
+        region: us-east-1
+        role: primary
+        capacity: 1000+
+        sizing:
+          controlPlane: 3
+          workers: 5
+          autoscale: true
+          workerMin: 5
+          workerMax: 15
+        federation:
+          secondary: production-hub-secondary
+          failoverType: manual
+          healthCheckInterval: 30s
+        description: Production primary hub (active) in US East
+      
+      - name: production-hub-secondary
+        environment: production
+        provider: aws
+        region: eu-west-1
+        role: secondary
+        capacity: 1000+
+        sizing:
+          controlPlane: 3
+          workers: 5
+          autoscale: true
+          workerMin: 5
+          workerMax: 15
+        federation:
+          primary: production-hub-primary
+          failoverType: manual
+          healthCheckInterval: 30s
+        description: Production secondary hub (passive) in EU West for disaster recovery
+  
+  features.yaml: |
+    # OCM feature gates enabled across all hubs
+    featureGates:
+      - name: ClusterImporter
+        enabled: true
+        description: Auto-import CAPI clusters into OCM
+      
+      - name: ManagedClusterAutoApproval
+        enabled: true
+        description: Auto-approve cluster registration (dev/staging only)
+      
+      - name: DefaultClusterSet
+        enabled: true
+        description: Automatic cluster set assignment
+      
+      - name: ManifestWorkReplicaSet
+        enabled: true
+        description: Distribute work across multiple clusters
+      
+      - name: Placement
+        enabled: true
+        description: Advanced cluster placement decisions
+  
+  secrets.yaml: |
+    # Environment-scoped secret naming conventions
+    # These secrets are stored in GitHub repository secrets
+    
+    secretMapping:
+      dev:
+        hubKubeconfig: DEV_OCM_HUB_KUBECONFIG
+        bootstrapToken: DEV_OCM_HUB_BOOTSTRAP_TOKEN
+        apiUrl: DEV_OCM_HUB_API_URL
+        caCert: DEV_OCM_HUB_CA_CERT
+        clusterManagerToken: DEV_OCM_CLUSTER_MANAGER_TOKEN
+      
+      staging:
+        hubKubeconfig: STAGING_OCM_HUB_KUBECONFIG
+        bootstrapToken: STAGING_OCM_HUB_BOOTSTRAP_TOKEN
+        apiUrl: STAGING_OCM_HUB_API_URL
+        caCert: STAGING_OCM_HUB_CA_CERT
+        clusterManagerToken: STAGING_OCM_CLUSTER_MANAGER_TOKEN
+      
+      production-primary:
+        hubKubeconfig: PRODUCTION_PRIMARY_OCM_HUB_KUBECONFIG
+        bootstrapToken: PRODUCTION_PRIMARY_OCM_HUB_BOOTSTRAP_TOKEN
+        apiUrl: PRODUCTION_PRIMARY_OCM_HUB_API_URL
+        caCert: PRODUCTION_PRIMARY_OCM_HUB_CA_CERT
+        clusterManagerToken: PRODUCTION_PRIMARY_OCM_CLUSTER_MANAGER_TOKEN
+      
+      production-secondary:
+        hubKubeconfig: PRODUCTION_SECONDARY_OCM_HUB_KUBECONFIG
+        bootstrapToken: PRODUCTION_SECONDARY_OCM_HUB_BOOTSTRAP_TOKEN
+        apiUrl: PRODUCTION_SECONDARY_OCM_HUB_API_URL
+        caCert: PRODUCTION_SECONDARY_OCM_HUB_CA_CERT
+        clusterManagerToken: PRODUCTION_SECONDARY_OCM_CLUSTER_MANAGER_TOKEN

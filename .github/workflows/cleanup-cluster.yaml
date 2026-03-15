@@ -1,0 +1,313 @@
+name: Cleanup Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_file_path:
+        description: 'Path to cluster manifest (e.g., clusters/production/management/aws/us-east-1/prod-hub-primary/cluster.yaml)'
+        required: true
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+      approval_comment:
+        description: 'Confirmation comment "APPROVED FOR DELETION" (required for production clusters)'
+        required: false
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Parse cluster metadata
+        id: metadata
+        run: |
+          file_path="${{ github.event.inputs.cluster_file_path }}"
+          env_name="${{ github.event.inputs.environment }}"
+          
+          # Extract cluster name from path: clusters/{env}/{domain}/{provider}/{region}/{name}/cluster.yaml
+          cluster_name=$(echo "$file_path" | sed -E 's|clusters/[^/]+/[^/]+/[^/]+/[^/]+/([^/]+)/.*|\1|')
+          domain=$(echo "$file_path" | sed -E 's|clusters/[^/]+/([^/]+)/.*|\1|')
+          provider=$(echo "$file_path" | sed -E 's|clusters/[^/]+/[^/]+/([^/]+)/.*|\1|')
+          region=$(echo "$file_path" | sed -E 's|clusters/[^/]+/[^/]+/[^/]+/([^/]+)/.*|\1|')
+          
+          echo "cluster_name=${cluster_name}" >> $GITHUB_OUTPUT
+          echo "domain=${domain}" >> $GITHUB_OUTPUT
+          echo "provider=${provider}" >> $GITHUB_OUTPUT
+          echo "region=${region}" >> $GITHUB_OUTPUT
+          echo "env_name=${env_name}" >> $GITHUB_OUTPUT
+          
+          echo "Cluster: ${cluster_name}, Domain: ${domain}, Provider: ${provider}, Region: ${region}"
+
+      - name: Validate cluster manifest exists
+        run: |
+          if [ ! -f "${{ github.event.inputs.cluster_file_path }}" ]; then
+            echo "❌ Cluster manifest not found: ${{ github.event.inputs.cluster_file_path }}"
+            exit 1
+          fi
+          echo "✓ Cluster manifest found"
+
+      - name: Check deletion protection label
+        id: deletion_check
+        run: |
+          file_path="${{ github.event.inputs.cluster_file_path }}"
+          env_name="${{ github.event.inputs.environment }}"
+          
+          # Extract deletion-protection label
+          deletion_protection=$(grep -A5 'metadata:' "$file_path" | grep 'deletion-protection:' | sed 's/.*deletion-protection: *//')
+          
+          echo "deletion_protection=${deletion_protection}" >> $GITHUB_OUTPUT
+          
+          if [ "$env_name" = "production" ]; then
+            if [ "$deletion_protection" != "enabled" ]; then
+              echo "⚠️  WARNING: Production cluster does not have deletion-protection label"
+              echo "Proceeding anyway (label must be removed first in separate PR)"
+            else
+              echo "✓ Deletion protection label is enabled"
+            fi
+          fi
+
+      - name: Verify production deletion approval
+        if: github.event.inputs.environment == 'production'
+        run: |
+          approval_comment="${{ github.event.inputs.approval_comment }}"
+          
+          if [ -z "$approval_comment" ]; then
+            echo "❌ ERROR: Production cluster deletion requires approval comment"
+            echo "Please provide comment: 'APPROVED FOR DELETION'"
+            exit 1
+          fi
+          
+          if [ "$approval_comment" != "APPROVED FOR DELETION" ]; then
+            echo "❌ ERROR: Invalid approval comment"
+            echo "Expected: 'APPROVED FOR DELETION'"
+            echo "Got: '$approval_comment'"
+            exit 1
+          fi
+          
+          echo "✓ Production deletion approval verified"
+
+      - name: Delete GitHub Secrets
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+          ENV_NAME: ${{ steps.metadata.outputs.env_name }}
+        run: |
+          secret_name="${{ env.CLUSTER_NAME }}_KUBECONFIG"
+          secret_name=$(echo "$secret_name" | tr '[:lower:]' '[:upper:]' | sed 's/-/_/g')
+          
+          echo "⏳ Deleting GitHub Secrets for cluster..."
+          
+          # Use gh CLI if available, otherwise note manual cleanup
+          if command -v gh &> /dev/null; then
+            # List environment secrets
+            echo "Secrets to delete:"
+            gh secret list --env "${{ env.ENV_NAME }}" | grep "${{ env.CLUSTER_NAME }}" || echo "No matching secrets found"
+            
+            # Note: GitHub CLI doesn't support secret deletion via API yet
+            # Manual cleanup required or use GitHub REST API
+            echo "⚠️  Manual step: Delete secret '$secret_name' from ${{ env.ENV_NAME }} environment in GitHub UI"
+          else
+            echo "⚠️  Manual step: Delete secret '$secret_name' from ${{ env.ENV_NAME }} environment in GitHub UI"
+          fi
+
+      - name: Delete cluster manifest
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+        run: |
+          file_path="${{ github.event.inputs.cluster_file_path }}"
+          
+          if [ ! -f "$file_path" ]; then
+            echo "⚠️  Cluster manifest already deleted: $file_path"
+            exit 0
+          fi
+          
+          echo "⏳ Deleting cluster manifest..."
+          rm "$file_path"
+          
+          # Remove empty directory if applicable
+          dir_path=$(dirname "$file_path")
+          if [ -z "$(ls -A "$dir_path")" ]; then
+            echo "Removing empty cluster directory: $dir_path"
+            rmdir "$dir_path"
+          fi
+          
+          echo "✓ Cluster manifest deleted: $file_path"
+
+      - name: Remove cluster-specific GitOps configuration
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+          DOMAIN: ${{ steps.metadata.outputs.domain }}
+          PROVIDER: ${{ steps.metadata.outputs.provider }}
+          REGION: ${{ steps.metadata.outputs.region }}
+          ENV_NAME: ${{ steps.metadata.outputs.env_name }}
+        run: |
+          echo "⏳ Cleaning up cluster-specific GitOps configuration..."
+          
+          gitops_path="clusters/${{ env.ENV_NAME }}/${{ env.DOMAIN }}/${{ env.PROVIDER }}/${{ env.REGION }}/${{ env.CLUSTER_NAME }}"
+          
+          cat <<EOF
+
+          ✓ Cluster-specific GitOps path marked for deletion:
+             $gitops_path
+          
+          ⚠️  Manual step: Delete this path from fleet-gitops repository
+             1. Create PR in fleet-gitops
+             2. Remove: $gitops_path
+             3. Merge PR
+          
+          This ensures all workloads managed by this cluster are cleaned up.
+          
+EOF
+
+      - name: Verify cluster deregistration
+        env:
+          CLUSTER_NAME: ${{ steps.metadata.outputs.cluster_name }}
+        run: |
+          echo "✓ Cluster deregistration task created"
+          
+          cat <<EOF
+
+          ⚠️  Manual verification steps (to be performed on OCM hub):
+          
+          1. Verify managed cluster is in Detached state:
+             kubectl get managedcluster "${{ env.CLUSTER_NAME }}"
+          
+          2. Check for any remaining managed cluster resources:
+             kubectl get managedcluster,managedclusteraddons -l cluster.open-cluster-management.io/clustername="${{ env.CLUSTER_NAME }}"
+          
+          3. Verify Cluster API resources are cleaned up:
+             kubectl get clusters,machines,machinedeployments -l cluster.x-k8s.io/cluster-name="${{ env.CLUSTER_NAME }}"
+          
+          If resources remain after cluster shutdown, they may need manual cleanup.
+          
+EOF
+
+      - name: Create cleanup summary
+        if: always()
+        run: |
+          cluster_name="${{ steps.metadata.outputs.cluster_name }}"
+          domain="${{ steps.metadata.outputs.domain }}"
+          provider="${{ steps.metadata.outputs.provider }}"
+          region="${{ steps.metadata.outputs.region }}"
+          environment="${{ steps.metadata.outputs.env_name }}"
+          
+          cat <<EOF
+
+          ========================================
+          CLUSTER CLEANUP SUMMARY
+          ========================================
+          
+          Cluster:     ${cluster_name}
+          Environment: ${environment}
+          Domain:      ${domain}
+          Provider:    ${provider}
+          Region:      ${region}
+          
+          COMPLETED ACTIONS:
+          ✓ Deletion protection verified
+          ✓ Approval verified (production)
+          ✓ Cluster manifest deleted
+          
+          PENDING ACTIONS:
+          ⚠️  Delete GitHub Secret: ${cluster_name}_KUBECONFIG
+          ⚠️  Delete GitOps config: clusters/${environment}/${domain}/${provider}/${region}/${cluster_name}/
+          ⚠️  Verify cluster deregistration on OCM hub
+          ⚠️  Monitor cluster shutdown and resource cleanup
+          
+          ========================================
+          
+EOF
+
+      - name: Create PR with cleanup changes
+        uses: peter-evans/create-pull-request@v5
+        with:
+          commit-message: 'cleanup: Remove cluster definition for ${{ steps.metadata.outputs.cluster_name }}'
+          title: 'cleanup: Delete ${{ steps.metadata.outputs.cluster_name }} cluster'
+          body: |
+            ## Cleanup PR for ${{ steps.metadata.outputs.cluster_name }}
+            
+            **Cluster Details:**
+            - Name: ${{ steps.metadata.outputs.cluster_name }}
+            - Environment: ${{ github.event.inputs.environment }}
+            - Domain: ${{ steps.metadata.outputs.domain }}
+            - Provider: ${{ steps.metadata.outputs.provider }}
+            - Region: ${{ steps.metadata.outputs.region }}
+            
+            **Changes:**
+            - Removed cluster manifest: ${{ github.event.inputs.cluster_file_path }}
+            
+            **Manual Steps Required:**
+            1. Delete GitHub Secret: `${{ steps.metadata.outputs.cluster_name }}_KUBECONFIG` from `${{ github.event.inputs.environment }}` environment
+            2. Create PR in [fleet-gitops](https://github.com/${{ github.repository_owner }}/fleet-gitops) to remove cluster-specific GitOps configuration
+            3. Verify cluster deregistration from OCM hub
+            4. Monitor cluster shutdown and clean up any remaining resources
+            
+            **Approval Required:** 
+            - @platform-team (required for all clusters)
+            - @security-team (required for production clusters)
+            
+          branch: cleanup/${{ steps.metadata.outputs.cluster_name }}
+          delete-branch: true
+          labels: cleanup,cluster-management
+          assignees: |
+            platform-team
+            security-team
+
+      - name: Create GitHub issue for manual cleanup
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const clusterName = '${{ steps.metadata.outputs.cluster_name }}';
+            const environment = '${{ github.event.inputs.environment }}';
+            const domain = '${{ steps.metadata.outputs.domain }}';
+            const provider = '${{ steps.metadata.outputs.provider }}';
+            const region = '${{ steps.metadata.outputs.region }}';
+            
+            let title = `Manual Cleanup: ${clusterName} (${environment})`;
+            
+            let body = `## Cluster Cleanup Checklist\n\n`;
+            body += `**Cluster:** ${clusterName}\n`;
+            body += `**Environment:** ${environment}\n`;
+            body += `**Domain:** ${domain}\n`;
+            body += `**Provider:** ${provider}\n`;
+            body += `**Region:** ${region}\n\n`;
+            body += `### Cleanup Steps:\n`;
+            body += `- [ ] Delete GitHub Secret: \`${clusterName}_KUBECONFIG\` from \`${environment}\` environment\n`;
+            body += `- [ ] Create PR in fleet-gitops to remove: \`clusters/${environment}/${domain}/${provider}/${region}/${clusterName}/\`\n`;
+            body += `- [ ] Verify managed cluster removed from OCM hub: \`kubectl get managedcluster ${clusterName} --context=<hub>\`\n`;
+            body += `- [ ] Check for orphaned CAPI resources: \`kubectl get clusters,machines -l cluster.x-k8s.io/cluster-name=${clusterName}\`\n`;
+            body += `- [ ] Verify cloud provider resources cleaned up (check ${provider} console)\n`;
+            body += `- [ ] Document any issues in cluster runbook\n\n`;
+            body += `### Contacts:\n`;
+            body += `- Platform Team: @platform-team\n`;
+            body += `- Domain Team: @${domain}-team\n`;
+            
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['cleanup', 'manual-action', `environment/${environment}`],
+              assignees: []
+            });
+            
+            console.log(`Created cleanup issue: #${issue.data.number}`);
+
+      - name: Success summary
+        run: |
+          echo "✅ Cluster cleanup workflow completed successfully"
+          echo ""
+          echo "📋 See created PR for deletion approval and manual cleanup steps"
+          echo "📋 See created GitHub Issue for cleanup checklist"

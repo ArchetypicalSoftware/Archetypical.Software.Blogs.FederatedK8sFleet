@@ -1,0 +1,27 @@
+apiVersion: operator.open-cluster-management.io/v1
+kind: ClusterManager
+metadata:
+  name: cluster-manager
+  namespace: open-cluster-management
+spec:
+  registrationConfiguration:
+    featureGates:
+      - feature: ClusterImporter
+        mode: Enable
+      - feature: ManagedClusterAutoApproval
+        mode: Enable
+      - feature: DefaultClusterSet
+        mode: Enable
+      - feature: ManifestWorkReplicaSet
+        mode: Enable
+      - feature: Placement
+        mode: Enable
+  deploymentConfig:
+    replicas: 1
+    resources:
+      limits:
+        cpu: "2"
+        memory: "4Gi"
+      requests:
+        cpu: "1"
+        memory: "2Gi"

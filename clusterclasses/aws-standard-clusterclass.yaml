@@ -1,0 +1,208 @@
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: ClusterClass
+metadata:
+  name: aws-standard
+  namespace: default
+spec:
+  infrastructure:
+    ref:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+      kind: AWSClusterTemplate
+      name: aws-standard-cluster-template
+  controlPlane:
+    ref:
+      apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+      kind: KubeadmControlPlaneTemplate
+      name: aws-standard-controlplane-template
+    machineInfrastructure:
+      ref:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+        kind: AWSMachineTemplate
+        name: aws-standard-controlplane-machinetemplate
+  workers:
+    machineDeployments:
+      - class: default-worker
+        template:
+          bootstrap:
+            ref:
+              apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+              kind: KubeadmConfigTemplate
+              name: aws-standard-worker-bootstrap-template
+          infrastructure:
+            ref:
+              apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+              kind: AWSMachineTemplate
+              name: aws-standard-worker-machinetemplate
+  variables:
+    - name: region
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: string
+          description: AWS region where cluster will be deployed
+    
+    - name: controlPlaneMachineType
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: m5.large
+          description: EC2 instance type for control plane
+    
+    - name: workerMachineType
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: m5.large
+          description: EC2 instance type for worker nodes
+    
+    - name: workerMinReplicas
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: integer
+          default: 1
+          minimum: 0
+          description: Minimum worker replicas for autoscaling
+    
+    - name: workerMaxReplicas
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: integer
+          default: 10
+          minimum: 1
+          maximum: 100
+          description: Maximum worker replicas for autoscaling
+    
+    - name: autoscalerEnabled
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: boolean
+          default: true
+          description: Enable cluster autoscaler for worker nodes
+    
+    - name: scaleDownDelayAfterAdd
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: "10m"
+          description: Time to wait after scale up before attempting scale down
+    
+    - name: scaleDownUnneededTime
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: "10m"
+          description: Time a node should be unneeded before removal
+    
+    - name: scaleDownUtilizationThreshold
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: "0.5"
+          description: Threshold below which a node can be considered unneeded
+    
+    - name: kubernetesVersion
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: string
+          description: Kubernetes version (e.g., v1.30.0)
+  
+  patches:
+    # Region patch
+    - name: aws-cluster-region
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+            kind: AWSClusterTemplate
+          jsonPatches:
+            - op: replace
+              path: "/spec/template/spec/region"
+              valueFrom:
+                variable: region
+    
+    # Control plane machine type
+    - name: controlplane-instance-type
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+            kind: AWSMachineTemplate
+            matchResources:
+              controlPlane: true
+          jsonPatches:
+            - op: replace
+              path: "/spec/template/spec/instanceType"
+              valueFrom:
+                variable: controlPlaneMachineType
+    
+    # Worker machine type
+    - name: worker-instance-type
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+            kind: AWSMachineTemplate
+            matchResources:
+              machineDeploymentClass:
+                names: ["default-worker"]
+          jsonPatches:
+            - op: replace
+              path: "/spec/template/spec/instanceType"
+              valueFrom:
+                variable: workerMachineType
+    
+    # Kubernetes version
+    - name: kubernetes-version
+      definitions:
+        - selector:
+            apiVersion: cluster.x-k8s.io/v1beta1
+            kind: Cluster
+          jsonPatches:
+            - op: replace
+              path: "/spec/topology/version"
+              valueFrom:
+                variable: kubernetesVersion
+    
+    # Autoscaler annotations
+    - name: autoscaler-annotations
+      enabledIf: "{{ if .autoscalerEnabled }}true{{ end }}"
+      definitions:
+        - selector:
+            apiVersion: cluster.x-k8s.io/v1beta1
+            kind: MachineDeployment
+            matchResources:
+              machineDeploymentClass:
+                names: ["default-worker"]
+          jsonPatches:
+            - op: add
+              path: "/spec/template/metadata/annotations"
+              valueFrom:
+                template: |
+                  cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size: "{{ .workerMinReplicas }}"
+                  cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size: "{{ .workerMaxReplicas }}"
+    
+    # AWS autoscaler tags
+    - name: aws-autoscaler-tags
+      enabledIf: "{{ if .autoscalerEnabled }}true{{ end }}"
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+            kind: AWSMachineTemplate
+            matchResources:
+              machineDeploymentClass:
+                names: ["default-worker"]
+          jsonPatches:
+            - op: add
+              path: "/spec/template/spec/additionalTags"
+              valueFrom:
+                template: |
+                  k8s.io/cluster-autoscaler/enabled: "true"
+                  k8s.io/cluster-autoscaler/{{ .builtin.cluster.name }}: "owned"
+                  managed-by: "capi"
+                  gitops-repo: "fleet-gitops"

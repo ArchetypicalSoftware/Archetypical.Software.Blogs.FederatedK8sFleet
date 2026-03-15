@@ -1,0 +1,49 @@
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: production-hub-secondary
+  namespace: default
+  labels:
+    team: platform
+    environment: production
+    cluster-type: management
+    deletion-protection: enabled
+  annotations:
+    description: "Production secondary OCM hub cluster (standby)"
+    owner: "platform-team"
+    requires-approval: "true"
+spec:
+  clusterNetwork:
+    pods:
+      cidrBlocks:
+        - 192.168.0.0/16
+    services:
+      cidrBlocks:
+        - 10.96.0.0/12
+  topology:
+    class: ocm-hub-clusterclass
+    version: v1.27.0
+    controlPlaneEndpoint:
+      host: ""
+      port: 6443
+    variables:
+      - name: region
+        value: eu-west-1
+      - name: hubRole
+        value: secondary
+      - name: environment
+        value: production
+      - name: controlPlaneMachineType
+        value: t3.medium
+      - name: workerMachineType
+        value: t3.large
+      - name: workerReplicas
+        value: 5
+      - name: workerMinReplicas
+        value: 5
+      - name: workerMaxReplicas
+        value: 15
+      - name: autoscalerEnabled
+        value: true
+      - name: kubernetesVersion
+        value: v1.27.0

@@ -2,6 +2,8 @@
 
 **GitHub-driven, multi-cloud Kubernetes cluster orchestration using Cluster API and Open Cluster Management**
 
+This repository is a companion to my Blog post at [The day we stopped managing our clusters](https://medium.com/archetypical-software/the-day-we-stopped-managing-our-clusters-d3c6e8bb19ec)
+
 ## Overview
 
 This repository implements a decentralized, GitOps-driven fleet management system for Kubernetes clusters across AWS, Azure, and GCP. It provides:
